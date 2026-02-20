@@ -5,6 +5,61 @@ from dataclasses import dataclass
 import numpy as np
 from numpy.typing import NDArray
 
+# Lazy-loaded MTCNN detector (expensive to initialize)
+_mtcnn_detector = None
+
+
+def get_mtcnn_detector():
+    """Lazy-load MTCNN detector (expensive to initialize, ~1-2s first call)."""
+    global _mtcnn_detector
+    if _mtcnn_detector is None:
+        from mtcnn import MTCNN
+        _mtcnn_detector = MTCNN()
+    return _mtcnn_detector
+
+
+def mtcnn_prefilter(image: NDArray[np.uint8]) -> "PrefilterResult":
+    """
+    Use MTCNN to detect if image contains faces.
+
+    MTCNN is a fast (~50-100ms) face detector using 3 cascaded CNNs.
+    Much more accurate than pixel-based heuristics for face detection.
+
+    Args:
+        image: RGB image array (H, W, 3)
+
+    Returns:
+        PrefilterResult with should_skip=True if no faces found.
+    """
+    h, w = image.shape[:2]
+    image_size = (h, w)
+
+    detector = get_mtcnn_detector()
+    faces = detector.detect_faces(image)
+
+    if not faces:
+        return PrefilterResult(
+            should_skip=True,
+            reason="MTCNN found no faces",
+            entropy=None,
+            skin_percentage=None,
+            image_size=image_size,
+            reference_skin_percentage=None,
+            used_targeted_filter=False,
+            mtcnn_faces=0,
+        )
+
+    return PrefilterResult(
+        should_skip=False,
+        reason="",
+        entropy=None,
+        skin_percentage=None,
+        image_size=image_size,
+        reference_skin_percentage=None,
+        used_targeted_filter=False,
+        mtcnn_faces=len(faces),
+    )
+
 
 @dataclass
 class PrefilterResult:
@@ -19,6 +74,7 @@ class PrefilterResult:
     used_targeted_filter: bool = False  # True if reference skin filter was used
     blob_aspect_ratio: float | None = None  # height/width of largest skin blob
     blob_percentage: float | None = None  # % of image covered by largest blob
+    mtcnn_faces: int | None = None  # Number of faces detected by MTCNN (None if not run)
 
 
 def calculate_entropy(image: NDArray[np.uint8]) -> float:
@@ -164,17 +220,22 @@ def calculate_reference_skin_percentage(
 def should_skip_cnn_targeted(
     image: NDArray[np.uint8],
     skin_info: dict | None = None,
+    use_mtcnn: bool = True,
 ) -> PrefilterResult:
     """
-    Enhanced prefilter using reference skin color (falls back to generic).
+    Enhanced prefilter using MTCNN face detection and/or skin color heuristics.
 
-    When skin_info is provided, uses the reference person's actual skin color
-    for more accurate filtering. This prevents false positives from wood,
-    leather, sand, etc. that match the generic skin heuristic.
+    Filtering stages (in order):
+    1. Size check (~0ms) - Skip images too small to contain faces
+    2. Entropy check (~13ms) - Skip blank/solid images
+    3. MTCNN check (~50-100ms) - Use neural network face detection (if enabled)
+    4. Skin heuristics (~20ms) - Fall back to pixel-based skin color detection (if MTCNN disabled)
 
     Args:
         image: RGB image array (H, W, 3)
         skin_info: Optional dict with "median_rgb" and "std_rgb" from reference analysis
+        use_mtcnn: If True, use MTCNN face detection instead of skin heuristics.
+            MTCNN is more accurate but requires TensorFlow. Default: True.
 
     Returns:
         PrefilterResult with skip decision and computed scores.
@@ -207,7 +268,36 @@ def should_skip_cnn_targeted(
             used_targeted_filter=skin_info is not None,
         )
 
-    # Stage 3: Skin tone check
+    # Stage 3: MTCNN face detection (~50-100ms)
+    # MTCNN uses 3 cascaded neural networks for accurate face detection.
+    # Much more reliable than pixel-based heuristics.
+    if use_mtcnn:
+        mtcnn_result = mtcnn_prefilter(image)
+        if mtcnn_result.should_skip:
+            return PrefilterResult(
+                should_skip=True,
+                reason=mtcnn_result.reason,
+                entropy=entropy,
+                skin_percentage=None,
+                image_size=image_size,
+                reference_skin_percentage=None,
+                used_targeted_filter=skin_info is not None,
+                mtcnn_faces=mtcnn_result.mtcnn_faces,
+            )
+        # MTCNN found faces - image passes prefilter
+        return PrefilterResult(
+            should_skip=False,
+            reason="",
+            entropy=entropy,
+            skin_percentage=None,
+            image_size=image_size,
+            reference_skin_percentage=None,
+            used_targeted_filter=skin_info is not None,
+            mtcnn_faces=mtcnn_result.mtcnn_faces,
+        )
+
+    # Stage 4: Skin heuristics (only if MTCNN disabled)
+    # Skin tone check
     # Use hybrid filter if reference skin info is available:
     # Require BOTH generic skin detection AND reference skin detection to pass.
     # This prevents false positives from wood, sand, etc. that may pass one but not both.

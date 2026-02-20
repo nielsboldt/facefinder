@@ -26,6 +26,7 @@ class MatchInfo:
     prefilter_skin_pct: float | None = None  # % of skin-toned pixels from prefilter (generic)
     prefilter_ref_skin_pct: float | None = None  # % of pixels matching reference skin color
     used_targeted_filter: bool = False  # True if reference skin filter was used
+    prefilter_mtcnn_faces: int | None = None  # Number of faces detected by MTCNN (None if not run)
 
 
 def iter_images(directory: Path, recursive: bool = False) -> Iterator[Path]:
@@ -55,6 +56,7 @@ def is_match(
     tolerance: float = 0.40,
     model: str = "hog",
     skin_info: dict | None = None,
+    use_mtcnn: bool = True,
 ) -> bool:
     """
     Check if an image contains a face matching the reference encoding.
@@ -90,7 +92,7 @@ def is_match(
 
         # Prefilter for CNN: skip images that definitely have no people
         if model == "cnn":
-            prefilter = should_skip_cnn_targeted(image, skin_info)
+            prefilter = should_skip_cnn_targeted(image, skin_info, use_mtcnn=use_mtcnn)
             if prefilter.should_skip:
                 return False  # No people detected, skip expensive CNN
 
@@ -99,7 +101,7 @@ def is_match(
             face_locations = face_recognition.face_locations(image, model="hog")
             if not face_locations:
                 # Prefilter before CNN fallback
-                prefilter = should_skip_cnn_targeted(image, skin_info)
+                prefilter = should_skip_cnn_targeted(image, skin_info, use_mtcnn=use_mtcnn)
                 if prefilter.should_skip:
                     return False  # No people detected, skip expensive CNN
                 # Fall back to CNN if no faces found
@@ -126,6 +128,7 @@ def check_match(
     model: str = "hog",
     prefilter_result: PrefilterResult | None = None,
     skin_info: dict | None = None,
+    use_mtcnn: bool = True,
 ) -> MatchInfo:
     """
     Check if an image contains a face matching the reference encoding.
@@ -166,7 +169,7 @@ def check_match(
         # Prefilter for CNN: skip images that definitely have no people
         if model == "cnn":
             if prefilter is None:
-                prefilter = should_skip_cnn_targeted(image, skin_info)
+                prefilter = should_skip_cnn_targeted(image, skin_info, use_mtcnn=use_mtcnn)
             if prefilter.should_skip:
                 return MatchInfo(
                     matched=False,
@@ -178,6 +181,7 @@ def check_match(
                     prefilter_skin_pct=prefilter.skin_percentage,
                     prefilter_ref_skin_pct=prefilter.reference_skin_percentage,
                     used_targeted_filter=prefilter.used_targeted_filter,
+                    prefilter_mtcnn_faces=prefilter.mtcnn_faces,
                 )
 
         if model == "auto":
@@ -186,7 +190,7 @@ def check_match(
             if not face_locations:
                 # Prefilter before CNN fallback (use pre-computed if available)
                 if prefilter is None:
-                    prefilter = should_skip_cnn_targeted(image, skin_info)
+                    prefilter = should_skip_cnn_targeted(image, skin_info, use_mtcnn=use_mtcnn)
                 if prefilter.should_skip:
                     return MatchInfo(
                         matched=False,
@@ -198,6 +202,7 @@ def check_match(
                         prefilter_skin_pct=prefilter.skin_percentage,
                         prefilter_ref_skin_pct=prefilter.reference_skin_percentage,
                         used_targeted_filter=prefilter.used_targeted_filter,
+                        prefilter_mtcnn_faces=prefilter.mtcnn_faces,
                     )
                 # Fall back to CNN if no faces found
                 face_locations = face_recognition.face_locations(image, model="cnn")
@@ -215,6 +220,7 @@ def check_match(
                 prefilter_skin_pct=prefilter.skin_percentage if prefilter else None,
                 prefilter_ref_skin_pct=prefilter.reference_skin_percentage if prefilter else None,
                 used_targeted_filter=prefilter.used_targeted_filter if prefilter else False,
+                prefilter_mtcnn_faces=prefilter.mtcnn_faces if prefilter else None,
             )
 
         # Check each face in the image against the reference
@@ -230,6 +236,7 @@ def check_match(
             prefilter_skin_pct=prefilter.skin_percentage if prefilter else None,
             prefilter_ref_skin_pct=prefilter.reference_skin_percentage if prefilter else None,
             used_targeted_filter=prefilter.used_targeted_filter if prefilter else False,
+            prefilter_mtcnn_faces=prefilter.mtcnn_faces if prefilter else None,
         )
     except Exception as e:
         raise MatchError(f"Error processing {image_path.name}: {e}") from e
@@ -276,6 +283,8 @@ def process_images_prefilter_only(
     limit: int | None = None,
     progress_callback: callable = None,
     skin_info: dict | None = None,
+    use_mtcnn: bool = True,
+    reject_dir: Path | None = None,
 ) -> MatchResult:
     """
     Process images using only prefilter, copying passing images.
@@ -295,6 +304,9 @@ def process_images_prefilter_only(
              prefilter: PrefilterResult | None)
         skin_info: Optional dict with reference skin color for targeted prefiltering.
             When provided, uses reference-targeted prefilter instead of generic.
+        use_mtcnn: If True, use MTCNN face detection instead of skin heuristics.
+            MTCNN is more accurate but requires TensorFlow. Default: True.
+        reject_dir: Optional directory to copy rejected images to (for testing/debugging).
 
     Returns:
         MatchResult with total_scanned, matches_found (images that passed),
@@ -316,6 +328,8 @@ def process_images_prefilter_only(
 
             # Validate image shape (must be 3-channel RGB)
             if len(image.shape) != 3 or image.shape[2] != 3:
+                if reject_dir is not None:
+                    copy_image(image_path, reject_dir)
                 if progress_callback:
                     progress_callback(image_path, passed=False, error=False, error_msg=None, prefilter=None)
                 continue
@@ -328,7 +342,7 @@ def process_images_prefilter_only(
             image = resize_for_cnn(image)
 
             # Run prefilter
-            prefilter = should_skip_cnn_targeted(image, skin_info)
+            prefilter = should_skip_cnn_targeted(image, skin_info, use_mtcnn=use_mtcnn)
 
             if not prefilter.should_skip:
                 # Image passes prefilter - copy it
@@ -342,6 +356,9 @@ def process_images_prefilter_only(
                 if limit is not None and result.matches_found >= limit:
                     break
             else:
+                # Image rejected by prefilter
+                if reject_dir is not None:
+                    copy_image(image_path, reject_dir)
                 if progress_callback:
                     progress_callback(image_path, passed=False, error=False, error_msg=None, prefilter=prefilter)
 
@@ -366,6 +383,8 @@ def process_images(
     verbose: bool = False,
     prefilter_callback: callable = None,
     skin_info: dict | None = None,
+    use_mtcnn: bool = True,
+    reject_dir: Path | None = None,
 ) -> MatchResult:
     """
     Main processing loop: iterate images, check matches, copy immediately.
@@ -393,6 +412,10 @@ def process_images(
             in real-time. Signature: prefilter_callback(image_path: Path, prefilter: PrefilterResult)
         skin_info: Optional dict with reference skin color for targeted prefiltering.
             When provided, uses reference-targeted prefilter instead of generic.
+        use_mtcnn: If True, use MTCNN face detection in prefilter instead of skin heuristics.
+            MTCNN is more accurate but requires TensorFlow. Default: True.
+        reject_dir: Optional directory to copy rejected images to (for testing/debugging).
+            Images are copied when skipped by prefilter or when they don't match.
     """
     result = MatchResult()
 
@@ -418,7 +441,7 @@ def process_images(
                     if image.dtype != np.uint8:
                         image = image.astype(np.uint8)
                     image = resize_for_cnn(image)
-                    prefilter_result = should_skip_cnn_targeted(image, skin_info)
+                    prefilter_result = should_skip_cnn_targeted(image, skin_info, use_mtcnn=use_mtcnn)
                     prefilter_callback(image_path, prefilter_result)
             except Exception:
                 pass  # Prefilter errors will be handled by check_match
@@ -428,7 +451,8 @@ def process_images(
                 # Use check_match for detailed info (pass prefilter to avoid recompute)
                 match_info = check_match(
                     image_path, reference_encoding, tolerance, model=model,
-                    prefilter_result=prefilter_result, skin_info=skin_info
+                    prefilter_result=prefilter_result, skin_info=skin_info,
+                    use_mtcnn=use_mtcnn
                 )
                 if match_info.matched:
                     copied_path = copy_image(image_path, output_dir)
@@ -442,11 +466,14 @@ def process_images(
                     if limit is not None and result.matches_found >= limit:
                         break
                 else:
+                    # Image rejected - copy to reject_dir if provided
+                    if reject_dir is not None:
+                        copy_image(image_path, reject_dir)
                     if progress_callback:
                         progress_callback(image_path, matched=False, match_info=match_info)
             else:
                 # Use is_match for simple bool result (faster, less memory)
-                if is_match(image_path, reference_encoding, tolerance, model=model, skin_info=skin_info):
+                if is_match(image_path, reference_encoding, tolerance, model=model, skin_info=skin_info, use_mtcnn=use_mtcnn):
                     copied_path = copy_image(image_path, output_dir)
                     result.matches_found += 1
                     result.matched_files.append(copied_path)
@@ -458,6 +485,9 @@ def process_images(
                     if limit is not None and result.matches_found >= limit:
                         break
                 else:
+                    # Image rejected - copy to reject_dir if provided
+                    if reject_dir is not None:
+                        copy_image(image_path, reject_dir)
                     if progress_callback:
                         progress_callback(image_path, matched=False)
         except Exception as e:

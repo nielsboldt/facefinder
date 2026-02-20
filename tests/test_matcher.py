@@ -336,11 +336,25 @@ class TestPrefilterIntegration:
         assert hasattr(result, 'prefilter_reason')
         assert hasattr(result, 'prefilter_entropy')
         assert hasattr(result, 'prefilter_skin_pct')
+        assert hasattr(result, 'prefilter_mtcnn_faces')
         # Real face image should not be skipped
         assert result.prefilter_skipped is False
-        # Scores should be populated for CNN mode
+        # Entropy should be populated for CNN mode (computed before MTCNN)
+        assert result.prefilter_entropy is not None
+        # With MTCNN enabled (default), mtcnn_faces should be populated
+        assert result.prefilter_mtcnn_faces is not None
+        assert result.prefilter_mtcnn_faces >= 1  # Face image should detect face
+
+    def test_check_match_with_cnn_skin_heuristics(self, reference_encoding, test_image):
+        """check_match with CNN and MTCNN disabled should use skin heuristics."""
+        result = check_match(test_image, reference_encoding, model="cnn", use_mtcnn=False)
+        # Real face image should not be skipped
+        assert result.prefilter_skipped is False
+        # Skin scores should be populated when MTCNN is disabled
         assert result.prefilter_entropy is not None
         assert result.prefilter_skin_pct is not None
+        # MTCNN not run
+        assert result.prefilter_mtcnn_faces is None
 
     def test_check_match_with_hog_no_prefilter(self, reference_encoding, test_image):
         """check_match with HOG should not use prefilter."""
@@ -380,8 +394,8 @@ class TestPrefilterIntegration:
         assert result.prefilter_entropy is not None
         assert result.prefilter_entropy < 3.5  # Low entropy = solid
 
-    def test_check_match_skips_landscape_no_skin_cnn(self, reference_encoding, tmp_path):
-        """check_match with CNN should skip landscape (blue/green) images."""
+    def test_check_match_skips_landscape_mtcnn(self, reference_encoding, tmp_path):
+        """check_match with CNN (MTCNN default) should skip landscape via MTCNN."""
         from PIL import Image
         import numpy as np
 
@@ -398,9 +412,36 @@ class TestPrefilterIntegration:
 
         result = check_match(landscape_image, reference_encoding, model="cnn")
         assert result.prefilter_skipped is True
+        assert "MTCNN" in result.prefilter_reason
+        # Entropy should be populated (computed before MTCNN)
+        assert result.prefilter_entropy is not None
+        assert result.prefilter_entropy > 3.5  # High entropy landscape
+        # MTCNN found no faces
+        assert result.prefilter_mtcnn_faces == 0
+
+    def test_check_match_skips_landscape_no_skin_cnn(self, reference_encoding, tmp_path):
+        """check_match with CNN (MTCNN disabled) should skip landscape via skin heuristics."""
+        from PIL import Image
+        import numpy as np
+
+        # Create varied blue/green landscape-like image (high entropy, no skin)
+        landscape_image = tmp_path / "landscape.jpg"
+        rng = np.random.default_rng(42)
+        # Create image with varied blue/green tones (no red dominance = no skin)
+        pixels = np.zeros((200, 200, 3), dtype=np.uint8)
+        pixels[:, :, 0] = rng.integers(0, 80, size=(200, 200), dtype=np.uint8)    # Low red
+        pixels[:, :, 1] = rng.integers(100, 200, size=(200, 200), dtype=np.uint8) # Green
+        pixels[:, :, 2] = rng.integers(150, 255, size=(200, 200), dtype=np.uint8) # Blue
+        img = Image.fromarray(pixels)
+        img.save(landscape_image)
+
+        result = check_match(landscape_image, reference_encoding, model="cnn", use_mtcnn=False)
+        assert result.prefilter_skipped is True
         assert "skin" in result.prefilter_reason
         # Both entropy and skin should be populated
         assert result.prefilter_entropy is not None
         assert result.prefilter_entropy > 3.5  # High entropy landscape
         assert result.prefilter_skin_pct is not None
         assert result.prefilter_skin_pct < 1.0  # No skin detected
+        # MTCNN not run
+        assert result.prefilter_mtcnn_faces is None

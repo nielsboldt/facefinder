@@ -252,6 +252,17 @@ def analyze(
     default=False,
     help="Show distance values for each image (useful for tuning tolerance).",
 )
+@click.option(
+    "--no-mtcnn",
+    is_flag=True,
+    default=False,
+    help="Disable MTCNN prefilter (use skin-color heuristics instead).",
+)
+@click.option(
+    "--reject-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    help="Directory to copy rejected/non-matching images to (for testing/debugging).",
+)
 def find(
     reference_dir: Path | None,
     encoding: Path | None,
@@ -263,6 +274,8 @@ def find(
     limit: int | None,
     log: Path | None,
     verbose: bool,
+    no_mtcnn: bool,
+    reject_dir: Path | None,
 ) -> None:
     """Find images containing a specific person.
 
@@ -335,12 +348,16 @@ def find(
                 "These may have no detectable faces or contain different people."
             )
 
-    # Display targeted prefilter status
-    if skin_info and model in ("cnn", "auto"):
-        r, g, b = skin_info["median_rgb"]
-        info_output(f"Targeted skin prefilter: enabled (RGB: {r}, {g}, {b})")
-    elif model in ("cnn", "auto"):
-        info_output("Targeted skin prefilter: disabled (using generic heuristic)")
+    # Display prefilter status
+    use_mtcnn = not no_mtcnn
+    if model in ("cnn", "auto"):
+        if use_mtcnn:
+            info_output("MTCNN prefilter: enabled")
+        elif skin_info:
+            r, g, b = skin_info["median_rgb"]
+            info_output(f"Skin prefilter: enabled (RGB: {r}, {g}, {b})")
+        else:
+            info_output("Skin prefilter: using generic heuristic")
 
     # Determine input source
     using_stdin = search_dir is None
@@ -382,6 +399,8 @@ def find(
     def log_prefilter(image_path: Path, prefilter: PrefilterResult) -> None:
         """Log prefilter result immediately after it's computed."""
         scores = []
+        if prefilter.mtcnn_faces is not None:
+            scores.append(f"mtcnn_faces={prefilter.mtcnn_faces}")
         if prefilter.entropy is not None:
             scores.append(f"entropy={prefilter.entropy:.1f}")
         if prefilter.reference_skin_percentage is not None:
@@ -469,6 +488,8 @@ def find(
             verbose=verbose or (log is not None),
             prefilter_callback=log_prefilter if (verbose or log) else None,
             skin_info=skin_info,
+            use_mtcnn=use_mtcnn,
+            reject_dir=reject_dir,
         )
     except KeyboardInterrupt:
         interrupted = True
@@ -571,6 +592,17 @@ def find(
     default=False,
     help="Show prefilter scores for each image.",
 )
+@click.option(
+    "--no-mtcnn",
+    is_flag=True,
+    default=False,
+    help="Disable MTCNN prefilter (use skin-color heuristics instead).",
+)
+@click.option(
+    "--reject-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    help="Directory to copy rejected images to (for testing/debugging).",
+)
 def prefilter(
     search_dir: Path | None,
     output_dir: Path,
@@ -579,13 +611,16 @@ def prefilter(
     limit: int | None,
     log: Path | None,
     verbose: bool,
+    no_mtcnn: bool,
+    reject_dir: Path | None,
 ) -> None:
     """Copy images that pass prefilter (likely contain people) to output directory.
 
     This command runs only the fast prefilter (no face detection) to quickly
     filter a large photo collection to images likely containing people.
 
-    Without --encoding: uses generic skin-tone detection.
+    By default, uses MTCNN neural network for accurate face detection.
+    With --no-mtcnn: uses skin-color heuristics (faster, less accurate).
     With --encoding: uses targeted filtering based on reference person's skin color.
 
     Input modes:
@@ -623,13 +658,18 @@ def prefilter(
     if encoding is not None:
         info_output(f"Loading encoding from: {encoding}")
         _, skin_info = load_encoding(encoding)
-        if skin_info:
-            r, g, b = skin_info["median_rgb"]
-            info_output(f"Targeted skin filter: enabled (RGB: {r}, {g}, {b})")
-        else:
-            info_output("Targeted skin filter: disabled (encoding has no skin data)")
+
+    # Display prefilter status
+    use_mtcnn = not no_mtcnn
+    if use_mtcnn:
+        info_output("MTCNN prefilter: enabled")
+    elif skin_info:
+        r, g, b = skin_info["median_rgb"]
+        info_output(f"Skin prefilter: enabled (RGB: {r}, {g}, {b})")
+    elif encoding:
+        info_output("Skin prefilter: using generic heuristic (encoding has no skin data)")
     else:
-        info_output("Using generic prefilter (no encoding provided)")
+        info_output("Skin prefilter: using generic heuristic (no encoding provided)")
 
     # Determine input source
     using_stdin = search_dir is None
@@ -652,6 +692,8 @@ def prefilter(
     def format_prefilter(pf) -> str:
         """Format prefilter scores for display."""
         parts = []
+        if pf.mtcnn_faces is not None:
+            parts.append(f"mtcnn_faces={pf.mtcnn_faces}")
         if pf.entropy is not None:
             parts.append(f"entropy={pf.entropy:.1f}")
         if pf.reference_skin_percentage is not None:
@@ -713,6 +755,8 @@ def prefilter(
             limit=limit,
             progress_callback=update_progress,
             skin_info=skin_info,
+            use_mtcnn=use_mtcnn,
+            reject_dir=reject_dir,
         )
         # Sync counts from result
         scanned = result.total_scanned
