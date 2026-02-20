@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wc:*)",
+      "Bash(python -m pytest:*)",
+      "Bash(python3 -m pytest:*)",
+      "Bash(uv run pytest:*)",
+      "Bash(uv run face-finder find:*)",
+      "Bash(uv run face-finder analyze:*)",
+      "Bash(find:*)",
+      "Bash(uv run python3:*)",
+      "Bash(grep:*)",
+      "Bash(python3:*)",
+      "Bash(source:*)",
+      "Bash(uv run python:*)",
+      "Bash(xxd:*)",
+      "Bash(uv add:*)",
+      "Bash(uv run face-finder prefilter:*)",
+      "Bash(uv run:*)",
+      "Bash(uv pip install mediapipe)"
+    ]
+  }
+}
