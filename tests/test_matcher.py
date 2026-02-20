@@ -327,33 +327,28 @@ class TestFalsePositiveRejection:
 
 
 class TestPrefilterIntegration:
-    """Test prefilter integration with matching functions."""
+    """Test prefilter integration with matching functions.
 
-    def test_check_match_with_cnn_returns_prefilter_info(self, reference_encoding, test_image):
-        """check_match with CNN should include prefilter info (even if not skipped)."""
+    Note: Prefiltering is now done in process_images(), not in check_match/is_match.
+    These tests verify that:
+    1. check_match/is_match no longer do prefiltering (single responsibility)
+    2. process_images correctly runs prefiltering before matching
+    """
+
+    def test_check_match_no_prefilter_fields_populated(self, reference_encoding, test_image):
+        """check_match does not populate prefilter fields (caller responsibility)."""
         result = check_match(test_image, reference_encoding, model="cnn")
+        # check_match should have prefilter fields but not populate them
         assert hasattr(result, 'prefilter_skipped')
         assert hasattr(result, 'prefilter_reason')
         assert hasattr(result, 'prefilter_entropy')
         assert hasattr(result, 'prefilter_skin_pct')
         assert hasattr(result, 'prefilter_mtcnn_faces')
-        # Real face image should not be skipped
+        # All prefilter fields should be defaults (not populated by check_match)
         assert result.prefilter_skipped is False
-        # Entropy should be populated for CNN mode (computed before MTCNN)
-        assert result.prefilter_entropy is not None
-        # With MTCNN enabled (default), mtcnn_faces should be populated
-        assert result.prefilter_mtcnn_faces is not None
-        assert result.prefilter_mtcnn_faces >= 1  # Face image should detect face
-
-    def test_check_match_with_cnn_skin_heuristics(self, reference_encoding, test_image):
-        """check_match with CNN and MTCNN disabled should use skin heuristics."""
-        result = check_match(test_image, reference_encoding, model="cnn", use_mtcnn=False)
-        # Real face image should not be skipped
-        assert result.prefilter_skipped is False
-        # Skin scores should be populated when MTCNN is disabled
-        assert result.prefilter_entropy is not None
-        assert result.prefilter_skin_pct is not None
-        # MTCNN not run
+        assert result.prefilter_reason == ""
+        assert result.prefilter_entropy is None
+        assert result.prefilter_skin_pct is None
         assert result.prefilter_mtcnn_faces is None
 
     def test_check_match_with_hog_no_prefilter(self, reference_encoding, test_image):
@@ -367,7 +362,7 @@ class TestPrefilterIntegration:
         assert result.prefilter_skin_pct is None
 
     def test_is_match_skips_tiny_image_cnn(self, reference_encoding, tmp_path):
-        """is_match with CNN should skip tiny images via prefilter."""
+        """is_match with CNN should return False for tiny images (no faces detected)."""
         from PIL import Image
 
         # Create tiny 30x30 image
@@ -376,10 +371,10 @@ class TestPrefilterIntegration:
         img.save(tiny_image)
 
         result = is_match(tiny_image, reference_encoding, model="cnn")
-        assert result is False  # Should return False without running CNN
+        assert result is False  # No faces in tiny image
 
-    def test_check_match_skips_solid_color_cnn(self, reference_encoding, tmp_path):
-        """check_match with CNN should skip solid color images."""
+    def test_process_images_prefilter_skips_solid_color(self, reference_encoding, tmp_path):
+        """process_images with CNN should skip solid color images via prefilter."""
         from PIL import Image
 
         # Create solid color image
@@ -387,22 +382,56 @@ class TestPrefilterIntegration:
         img = Image.new('RGB', (200, 200), color=(100, 100, 100))
         img.save(solid_image)
 
-        result = check_match(solid_image, reference_encoding, model="cnn")
-        assert result.prefilter_skipped is True
-        assert "blank" in result.prefilter_reason or "solid" in result.prefilter_reason
-        # Entropy should be populated (computed before skip)
-        assert result.prefilter_entropy is not None
-        assert result.prefilter_entropy < 3.5  # Low entropy = solid
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+        reject_dir = tmp_path / "rejected"
 
-    def test_check_match_skips_landscape_mtcnn(self, reference_encoding, tmp_path):
-        """check_match with CNN (MTCNN default) should skip landscape via MTCNN."""
+        # Track prefilter callback results
+        prefilter_results = []
+        def prefilter_cb(path, prefilter):
+            prefilter_results.append((path, prefilter))
+
+        # Track progress callback results
+        progress_results = []
+        def progress_cb(path, matched, match_info=None, **kwargs):
+            progress_results.append((path, matched, match_info))
+
+        result = process_images(
+            image_source=tmp_path,
+            output_dir=output_dir,
+            reference_encoding=reference_encoding,
+            model="cnn",
+            verbose=True,
+            prefilter_callback=prefilter_cb,
+            progress_callback=progress_cb,
+            reject_dir=reject_dir,
+        )
+
+        # Should have processed 1 image
+        assert result.total_scanned == 1
+        assert result.matches_found == 0
+
+        # Prefilter should have been called with skip
+        assert len(prefilter_results) == 1
+        _, prefilter = prefilter_results[0]
+        assert prefilter.should_skip is True
+        assert prefilter.entropy is not None
+        assert prefilter.entropy < 3.5  # Low entropy = solid
+
+        # Progress callback should report prefilter_skipped
+        assert len(progress_results) == 1
+        _, matched, match_info = progress_results[0]
+        assert matched is False
+        assert match_info.prefilter_skipped is True
+
+    def test_process_images_prefilter_skips_landscape_mtcnn(self, reference_encoding, tmp_path):
+        """process_images with CNN should skip landscape via MTCNN prefilter."""
         from PIL import Image
         import numpy as np
 
         # Create varied blue/green landscape-like image (high entropy, no skin)
         landscape_image = tmp_path / "landscape.jpg"
         rng = np.random.default_rng(42)
-        # Create image with varied blue/green tones (no red dominance = no skin)
         pixels = np.zeros((200, 200, 3), dtype=np.uint8)
         pixels[:, :, 0] = rng.integers(0, 80, size=(200, 200), dtype=np.uint8)    # Low red
         pixels[:, :, 1] = rng.integers(100, 200, size=(200, 200), dtype=np.uint8) # Green
@@ -410,24 +439,51 @@ class TestPrefilterIntegration:
         img = Image.fromarray(pixels)
         img.save(landscape_image)
 
-        result = check_match(landscape_image, reference_encoding, model="cnn")
-        assert result.prefilter_skipped is True
-        assert "MTCNN" in result.prefilter_reason
-        # Entropy should be populated (computed before MTCNN)
-        assert result.prefilter_entropy is not None
-        assert result.prefilter_entropy > 3.5  # High entropy landscape
-        # MTCNN found no faces
-        assert result.prefilter_mtcnn_faces == 0
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
 
-    def test_check_match_skips_landscape_no_skin_cnn(self, reference_encoding, tmp_path):
-        """check_match with CNN (MTCNN disabled) should skip landscape via skin heuristics."""
+        prefilter_results = []
+        def prefilter_cb(path, prefilter):
+            prefilter_results.append((path, prefilter))
+
+        progress_results = []
+        def progress_cb(path, matched, match_info=None, **kwargs):
+            progress_results.append((path, matched, match_info))
+
+        result = process_images(
+            image_source=tmp_path,
+            output_dir=output_dir,
+            reference_encoding=reference_encoding,
+            model="cnn",
+            verbose=True,
+            prefilter_callback=prefilter_cb,
+            progress_callback=progress_cb,
+        )
+
+        assert result.total_scanned == 1
+        assert result.matches_found == 0
+
+        # Prefilter should have skipped via MTCNN
+        assert len(prefilter_results) == 1
+        _, prefilter = prefilter_results[0]
+        assert prefilter.should_skip is True
+        assert "MTCNN" in prefilter.reason
+        assert prefilter.mtcnn_faces == 0
+
+        # Match info should have prefilter details
+        assert len(progress_results) == 1
+        _, matched, match_info = progress_results[0]
+        assert matched is False
+        assert match_info.prefilter_skipped is True
+
+    def test_process_images_prefilter_skips_landscape_skin_heuristics(self, reference_encoding, tmp_path):
+        """process_images with CNN (MTCNN disabled) should skip landscape via skin heuristics."""
         from PIL import Image
         import numpy as np
 
         # Create varied blue/green landscape-like image (high entropy, no skin)
         landscape_image = tmp_path / "landscape.jpg"
         rng = np.random.default_rng(42)
-        # Create image with varied blue/green tones (no red dominance = no skin)
         pixels = np.zeros((200, 200, 3), dtype=np.uint8)
         pixels[:, :, 0] = rng.integers(0, 80, size=(200, 200), dtype=np.uint8)    # Low red
         pixels[:, :, 1] = rng.integers(100, 200, size=(200, 200), dtype=np.uint8) # Green
@@ -435,13 +491,71 @@ class TestPrefilterIntegration:
         img = Image.fromarray(pixels)
         img.save(landscape_image)
 
-        result = check_match(landscape_image, reference_encoding, model="cnn", use_mtcnn=False)
-        assert result.prefilter_skipped is True
-        assert "skin" in result.prefilter_reason
-        # Both entropy and skin should be populated
-        assert result.prefilter_entropy is not None
-        assert result.prefilter_entropy > 3.5  # High entropy landscape
-        assert result.prefilter_skin_pct is not None
-        assert result.prefilter_skin_pct < 1.0  # No skin detected
-        # MTCNN not run
-        assert result.prefilter_mtcnn_faces is None
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        prefilter_results = []
+        def prefilter_cb(path, prefilter):
+            prefilter_results.append((path, prefilter))
+
+        progress_results = []
+        def progress_cb(path, matched, match_info=None, **kwargs):
+            progress_results.append((path, matched, match_info))
+
+        result = process_images(
+            image_source=tmp_path,
+            output_dir=output_dir,
+            reference_encoding=reference_encoding,
+            model="cnn",
+            verbose=True,
+            use_mtcnn=False,  # Disable MTCNN, use skin heuristics
+            prefilter_callback=prefilter_cb,
+            progress_callback=progress_cb,
+        )
+
+        assert result.total_scanned == 1
+        assert result.matches_found == 0
+
+        # Prefilter should have skipped via skin heuristics
+        assert len(prefilter_results) == 1
+        _, prefilter = prefilter_results[0]
+        assert prefilter.should_skip is True
+        assert "skin" in prefilter.reason
+        assert prefilter.skin_percentage is not None
+        assert prefilter.skin_percentage < 1.0  # No skin detected
+        assert prefilter.mtcnn_faces is None  # MTCNN not run
+
+    def test_process_images_prefilter_passes_face_image(self, reference_encoding, test_image, tmp_path):
+        """process_images with CNN should pass face images through prefilter."""
+        import shutil
+
+        # Copy test image to tmp_path
+        dest = tmp_path / test_image.name
+        shutil.copy(test_image, dest)
+
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        prefilter_results = []
+        def prefilter_cb(path, prefilter):
+            prefilter_results.append((path, prefilter))
+
+        result = process_images(
+            image_source=tmp_path,
+            output_dir=output_dir,
+            reference_encoding=reference_encoding,
+            model="cnn",
+            verbose=True,
+            prefilter_callback=prefilter_cb,
+        )
+
+        # Should find the face
+        assert result.matches_found == 1
+
+        # Prefilter should have passed (not skipped)
+        assert len(prefilter_results) == 1
+        _, prefilter = prefilter_results[0]
+        assert prefilter.should_skip is False
+        # MTCNN should have found face(s)
+        assert prefilter.mtcnn_faces is not None
+        assert prefilter.mtcnn_faces >= 1

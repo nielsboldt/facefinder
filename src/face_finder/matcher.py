@@ -10,7 +10,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from .detector import IMAGE_EXTENSIONS, load_image_with_exif_rotation, resize_for_cnn
-from .prefilter import PrefilterResult, should_skip_cnn, should_skip_cnn_targeted
+from .prefilter import PrefilterResult, should_skip_cnn_targeted
 
 
 @dataclass
@@ -55,8 +55,6 @@ def is_match(
     reference_encoding: NDArray[np.float64],
     tolerance: float = 0.40,
     model: str = "hog",
-    skin_info: dict | None = None,
-    use_mtcnn: bool = True,
 ) -> bool:
     """
     Check if an image contains a face matching the reference encoding.
@@ -69,11 +67,12 @@ def is_match(
                - "hog" (fast, frontal faces only)
                - "cnn" (slower, better for angles/profiles)
                - "auto" (try hog first, fall back to cnn if no faces found)
-        skin_info: Optional dict with reference skin color for targeted prefiltering
 
     Returns True if any face in the image matches within the tolerance.
     Handles EXIF orientation to properly detect faces in rotated images.
     Raises MatchError if processing fails.
+
+    Note: Prefiltering should be done by the caller before calling this function.
     """
     try:
         image = load_image_with_exif_rotation(image_path)
@@ -90,20 +89,10 @@ def is_match(
         if model in ("cnn", "auto"):
             image = resize_for_cnn(image)
 
-        # Prefilter for CNN: skip images that definitely have no people
-        if model == "cnn":
-            prefilter = should_skip_cnn_targeted(image, skin_info, use_mtcnn=use_mtcnn)
-            if prefilter.should_skip:
-                return False  # No people detected, skip expensive CNN
-
         if model == "auto":
             # Try HOG first (fast)
             face_locations = face_recognition.face_locations(image, model="hog")
             if not face_locations:
-                # Prefilter before CNN fallback
-                prefilter = should_skip_cnn_targeted(image, skin_info, use_mtcnn=use_mtcnn)
-                if prefilter.should_skip:
-                    return False  # No people detected, skip expensive CNN
                 # Fall back to CNN if no faces found
                 face_locations = face_recognition.face_locations(image, model="cnn")
         else:
@@ -126,9 +115,6 @@ def check_match(
     reference_encoding: NDArray[np.float64],
     tolerance: float = 0.40,
     model: str = "hog",
-    prefilter_result: PrefilterResult | None = None,
-    skin_info: dict | None = None,
-    use_mtcnn: bool = True,
 ) -> MatchInfo:
     """
     Check if an image contains a face matching the reference encoding.
@@ -141,11 +127,12 @@ def check_match(
         reference_encoding: Face encoding to match against
         tolerance: Distance threshold for matching (0.40 = default, 0.6 = permissive)
         model: Face detection model ("hog", "cnn", or "auto")
-        prefilter_result: Pre-computed prefilter result (avoids recomputing if provided)
-        skin_info: Optional dict with reference skin color for targeted prefiltering
 
     Returns:
         MatchInfo with matched status, minimum distance, and number of faces detected.
+        Prefilter fields are left as defaults (caller populates them if needed).
+
+    Note: Prefiltering should be done by the caller before calling this function.
     """
     try:
         image = load_image_with_exif_rotation(image_path)
@@ -162,48 +149,10 @@ def check_match(
         if model in ("cnn", "auto"):
             image = resize_for_cnn(image)
 
-        # Track prefilter results for verbose output
-        # Use pre-computed result if provided, otherwise compute
-        prefilter: PrefilterResult | None = prefilter_result
-
-        # Prefilter for CNN: skip images that definitely have no people
-        if model == "cnn":
-            if prefilter is None:
-                prefilter = should_skip_cnn_targeted(image, skin_info, use_mtcnn=use_mtcnn)
-            if prefilter.should_skip:
-                return MatchInfo(
-                    matched=False,
-                    min_distance=None,
-                    num_faces=0,
-                    prefilter_skipped=True,
-                    prefilter_reason=prefilter.reason,
-                    prefilter_entropy=prefilter.entropy,
-                    prefilter_skin_pct=prefilter.skin_percentage,
-                    prefilter_ref_skin_pct=prefilter.reference_skin_percentage,
-                    used_targeted_filter=prefilter.used_targeted_filter,
-                    prefilter_mtcnn_faces=prefilter.mtcnn_faces,
-                )
-
         if model == "auto":
             # Try HOG first (fast)
             face_locations = face_recognition.face_locations(image, model="hog")
             if not face_locations:
-                # Prefilter before CNN fallback (use pre-computed if available)
-                if prefilter is None:
-                    prefilter = should_skip_cnn_targeted(image, skin_info, use_mtcnn=use_mtcnn)
-                if prefilter.should_skip:
-                    return MatchInfo(
-                        matched=False,
-                        min_distance=None,
-                        num_faces=0,
-                        prefilter_skipped=True,
-                        prefilter_reason=prefilter.reason,
-                        prefilter_entropy=prefilter.entropy,
-                        prefilter_skin_pct=prefilter.skin_percentage,
-                        prefilter_ref_skin_pct=prefilter.reference_skin_percentage,
-                        used_targeted_filter=prefilter.used_targeted_filter,
-                        prefilter_mtcnn_faces=prefilter.mtcnn_faces,
-                    )
                 # Fall back to CNN if no faces found
                 face_locations = face_recognition.face_locations(image, model="cnn")
         else:
@@ -212,16 +161,7 @@ def check_match(
         encodings = face_recognition.face_encodings(image, face_locations)
 
         if not encodings:
-            return MatchInfo(
-                matched=False,
-                min_distance=None,
-                num_faces=0,
-                prefilter_entropy=prefilter.entropy if prefilter else None,
-                prefilter_skin_pct=prefilter.skin_percentage if prefilter else None,
-                prefilter_ref_skin_pct=prefilter.reference_skin_percentage if prefilter else None,
-                used_targeted_filter=prefilter.used_targeted_filter if prefilter else False,
-                prefilter_mtcnn_faces=prefilter.mtcnn_faces if prefilter else None,
-            )
+            return MatchInfo(matched=False, min_distance=None, num_faces=0)
 
         # Check each face in the image against the reference
         distances = face_recognition.face_distance(encodings, reference_encoding)
@@ -232,11 +172,6 @@ def check_match(
             matched=matched,
             min_distance=min_distance,
             num_faces=len(encodings),
-            prefilter_entropy=prefilter.entropy if prefilter else None,
-            prefilter_skin_pct=prefilter.skin_percentage if prefilter else None,
-            prefilter_ref_skin_pct=prefilter.reference_skin_percentage if prefilter else None,
-            used_targeted_filter=prefilter.used_targeted_filter if prefilter else False,
-            prefilter_mtcnn_faces=prefilter.mtcnn_faces if prefilter else None,
         )
     except Exception as e:
         raise MatchError(f"Error processing {image_path.name}: {e}") from e
@@ -390,6 +325,7 @@ def process_images(
     Main processing loop: iterate images, check matches, copy immediately.
 
     Uses streaming/generator pattern for memory efficiency.
+    Prefiltering is done here, before calling match functions.
 
     Args:
         image_source: Directory to search for images, or an iterator of image paths.
@@ -432,28 +368,58 @@ def process_images(
         if pre_process_callback:
             pre_process_callback(image_path, model)
 
-        # Run prefilter immediately for CNN/auto models and fire callback
-        prefilter_result: PrefilterResult | None = None
-        if verbose and model in ("cnn", "auto") and prefilter_callback:
-            try:
+        try:
+            # Run prefilter for CNN/auto models BEFORE calling match functions
+            prefilter_result: PrefilterResult | None = None
+            if model in ("cnn", "auto"):
                 image = load_image_with_exif_rotation(image_path)
                 if len(image.shape) == 3 and image.shape[2] == 3:
                     if image.dtype != np.uint8:
                         image = image.astype(np.uint8)
                     image = resize_for_cnn(image)
                     prefilter_result = should_skip_cnn_targeted(image, skin_info, use_mtcnn=use_mtcnn)
-                    prefilter_callback(image_path, prefilter_result)
-            except Exception:
-                pass  # Prefilter errors will be handled by check_match
 
-        try:
+                    # Fire prefilter callback if provided
+                    if prefilter_callback:
+                        prefilter_callback(image_path, prefilter_result)
+
+                    # If prefilter says skip, handle rejection and continue
+                    if prefilter_result.should_skip:
+                        if reject_dir is not None:
+                            copy_image(image_path, reject_dir)
+                        if progress_callback:
+                            if verbose:
+                                # Create MatchInfo with prefilter details
+                                match_info = MatchInfo(
+                                    matched=False,
+                                    min_distance=None,
+                                    num_faces=0,
+                                    prefilter_skipped=True,
+                                    prefilter_reason=prefilter_result.reason,
+                                    prefilter_entropy=prefilter_result.entropy,
+                                    prefilter_skin_pct=prefilter_result.skin_percentage,
+                                    prefilter_ref_skin_pct=prefilter_result.reference_skin_percentage,
+                                    used_targeted_filter=prefilter_result.used_targeted_filter,
+                                    prefilter_mtcnn_faces=prefilter_result.mtcnn_faces,
+                                )
+                                progress_callback(image_path, matched=False, match_info=match_info)
+                            else:
+                                progress_callback(image_path, matched=False)
+                        continue
+
+            # Now call match function (prefilter already passed or not applicable)
             if verbose:
-                # Use check_match for detailed info (pass prefilter to avoid recompute)
                 match_info = check_match(
-                    image_path, reference_encoding, tolerance, model=model,
-                    prefilter_result=prefilter_result, skin_info=skin_info,
-                    use_mtcnn=use_mtcnn
+                    image_path, reference_encoding, tolerance, model=model
                 )
+                # Add prefilter info to match_info if we ran prefilter
+                if prefilter_result is not None:
+                    match_info.prefilter_entropy = prefilter_result.entropy
+                    match_info.prefilter_skin_pct = prefilter_result.skin_percentage
+                    match_info.prefilter_ref_skin_pct = prefilter_result.reference_skin_percentage
+                    match_info.used_targeted_filter = prefilter_result.used_targeted_filter
+                    match_info.prefilter_mtcnn_faces = prefilter_result.mtcnn_faces
+
                 if match_info.matched:
                     copied_path = copy_image(image_path, output_dir)
                     result.matches_found += 1
@@ -473,7 +439,7 @@ def process_images(
                         progress_callback(image_path, matched=False, match_info=match_info)
             else:
                 # Use is_match for simple bool result (faster, less memory)
-                if is_match(image_path, reference_encoding, tolerance, model=model, skin_info=skin_info, use_mtcnn=use_mtcnn):
+                if is_match(image_path, reference_encoding, tolerance, model=model):
                     copied_path = copy_image(image_path, output_dir)
                     result.matches_found += 1
                     result.matched_files.append(copied_path)
