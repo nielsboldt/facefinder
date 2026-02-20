@@ -17,7 +17,8 @@
       "Bash(uv add:*)",
       "Bash(uv run face-finder prefilter:*)",
       "Bash(uv run:*)",
-      "Bash(uv pip install mediapipe)"
+      "Bash(uv pip install mediapipe)",
+      "Bash(xargs:*)"
     ]
   }
 }

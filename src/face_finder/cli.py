@@ -6,6 +6,7 @@ from pathlib import Path
 import click
 
 from .detector import (
+    IMAGE_EXTENSIONS,
     analyze_reference_images,
     extract_face_thumbnail,
     load_encoding,
@@ -14,6 +15,24 @@ from .detector import (
 )
 from .matcher import process_images, process_images_prefilter_only
 from .prefilter import PrefilterResult
+
+
+def iter_paths_from_stdin():
+    """Read image paths from stdin, one per line.
+
+    Yields Path objects for valid image files. Logs warnings to stderr
+    for non-existent paths.
+    """
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        path = Path(line)
+        if path.suffix.lower() in IMAGE_EXTENSIONS:
+            if path.exists():
+                yield path
+            else:
+                click.echo(f"Warning: file not found: {path}", err=True)
 
 
 @click.group()
@@ -181,9 +200,9 @@ def analyze(
 @click.option(
     "--search-dir",
     "-s",
-    required=True,
+    required=False,
     type=click.Path(exists=True, file_okay=False, path_type=Path),
-    help="Directory to search for images containing the person.",
+    help="Directory to search for images. If omitted, reads image paths from stdin.",
 )
 @click.option(
     "--output-dir",
@@ -221,9 +240,10 @@ def analyze(
     help="Maximum number of matches to find (stops early when reached).",
 )
 @click.option(
-    "--debug-log",
+    "--log",
+    "-l",
     type=click.Path(dir_okay=False, path_type=Path),
-    help="Write debug log to file (useful for diagnosing crashes).",
+    help="Write detailed processing log to file.",
 )
 @click.option(
     "--verbose",
@@ -235,16 +255,30 @@ def analyze(
 def find(
     reference_dir: Path | None,
     encoding: Path | None,
-    search_dir: Path,
+    search_dir: Path | None,
     output_dir: Path,
     tolerance: float,
     model: str,
     recursive: bool,
     limit: int | None,
-    debug_log: Path | None,
+    log: Path | None,
     verbose: bool,
 ) -> None:
-    """Find images containing a specific person."""
+    """Find images containing a specific person.
+
+    Input modes:
+    - With --search-dir: scans the directory for images
+    - Without --search-dir: reads image paths from stdin (one per line)
+
+    Output modes:
+    - Non-verbose (default): prints every processed image path to stdout (enables resumability)
+    - Verbose (-v): prints detailed status for each image
+    - With --log: writes detailed log to file regardless of verbose mode
+
+    Matching images are copied to --output-dir regardless of output mode.
+    """
+    from typing import Iterator
+
     # Validate that exactly one of reference_dir or encoding is provided
     if reference_dir is None and encoding is None:
         click.echo("Error: Must provide either --reference-dir or --encoding.", err=True)
@@ -253,18 +287,40 @@ def find(
         click.echo("Error: Cannot provide both --reference-dir and --encoding.", err=True)
         raise SystemExit(1)
 
+    # Helper to write to debug log file
+    log_file = None
+    if log:
+        log_file = open(log, "w")
+
+    def log_write(msg: str) -> None:
+        """Write message to debug log file if open."""
+        if log_file:
+            log_file.write(msg + "\n")
+            log_file.flush()
+
+    def info_output(msg: str) -> None:
+        """Write informational message to appropriate destination."""
+        if verbose:
+            click.echo(msg)
+            sys.stdout.flush()
+        log_write(msg)
+
+    # Initialize debug log header
+    if log:
+        log_write("Face Finder Log")
+        log_write(f"Search dir: {search_dir if search_dir else 'stdin'}")
+        log_write(f"Model: {model}")
+        log_write("=" * 50)
+
     # Load encoding from file or analyze reference images
     skin_info: dict | None = None
     if encoding is not None:
-        click.echo(f"Loading encoding from: {encoding}")
-        sys.stdout.flush()
+        info_output(f"Loading encoding from: {encoding}")
         reference_encoding, skin_info = load_encoding(encoding)
-        click.echo("Encoding loaded successfully.")
-        sys.stdout.flush()
+        info_output("Encoding loaded successfully.")
     else:
-        click.echo(f"Loading reference images from: {reference_dir}")
-        click.echo(f"Model: {model}" + (" (better for profiles/side views)" if model == "cnn" else " (fast, frontal faces)"))
-        sys.stdout.flush()
+        info_output(f"Loading reference images from: {reference_dir}")
+        info_output(f"Model: {model}" + (" (better for profiles/side views)" if model == "cnn" else " (fast, frontal faces)"))
         result = load_reference_encodings(reference_dir, tolerance, model=model)
 
         if result is None:
@@ -272,52 +328,45 @@ def find(
             raise SystemExit(1)
 
         reference_encoding, images_with_face, total_images = result
-        click.echo(f"Found common face appearing in {images_with_face}/{total_images} reference images.")
+        info_output(f"Found common face appearing in {images_with_face}/{total_images} reference images.")
         if images_with_face < total_images:
-            click.echo(
+            info_output(
                 f"  Note: Face not found in {total_images - images_with_face} image(s). "
                 "These may have no detectable faces or contain different people."
             )
-        sys.stdout.flush()
 
     # Display targeted prefilter status
     if skin_info and model in ("cnn", "auto"):
         r, g, b = skin_info["median_rgb"]
-        click.echo(f"Targeted skin prefilter: enabled (RGB: {r}, {g}, {b})")
+        info_output(f"Targeted skin prefilter: enabled (RGB: {r}, {g}, {b})")
     elif model in ("cnn", "auto"):
-        click.echo("Targeted skin prefilter: disabled (using generic heuristic)")
-    sys.stdout.flush()
+        info_output("Targeted skin prefilter: disabled (using generic heuristic)")
 
-    # Scan images (streaming - no pre-count for large directories)
-    click.echo(f"Scanning images in: {search_dir}")
-    if recursive:
-        click.echo("(recursive mode enabled)")
-    click.echo("")
-    sys.stdout.flush()
+    # Determine input source
+    using_stdin = search_dir is None
+    if using_stdin:
+        info_output("Reading image paths from stdin...")
+        image_source: Path | Iterator[Path] = iter_paths_from_stdin()
+    else:
+        info_output(f"Scanning images in: {search_dir}")
+        if recursive:
+            info_output("(recursive mode enabled)")
+        image_source = search_dir
+
+    info_output("")
 
     # Track progress with per-image logging
     scanned = 0
     matches_found = 0
     errors_found = 0
 
-    # Open debug log file if requested
-    debug_file = None
-    if debug_log:
-        debug_file = open(debug_log, "w")
-        debug_file.write(f"Face Finder Debug Log\n")
-        debug_file.write(f"Search dir: {search_dir}\n")
-        debug_file.write(f"Model: {model}\n")
-        debug_file.write(f"{'=' * 50}\n")
-        debug_file.flush()
-
     def log_before_process(image_path: Path, model_used: str) -> None:
         """Log BEFORE processing each image (critical for crash diagnosis)."""
         msg = f"[PROCESSING] {image_path} model={model_used}"
-        click.echo(msg)
-        sys.stdout.flush()
-        if debug_file:
-            debug_file.write(msg + "\n")
-            debug_file.flush()
+        if verbose:
+            click.echo(msg)
+            sys.stdout.flush()
+        log_write(msg)
 
     def format_prefilter_scores(match_info) -> str:
         """Format prefilter scores for display."""
@@ -348,11 +397,10 @@ def find(
             status = "PASS"
 
         msg = f"  -> prefilter: {', '.join(scores)} -> {status}"
-        click.echo(msg)
-        sys.stdout.flush()
-        if debug_file:
-            debug_file.write(msg + "\n")
-            debug_file.flush()
+        if verbose:
+            click.echo(msg)
+            sys.stdout.flush()
+        log_write(msg)
 
     def update_progress(image_path: Path, matched: bool, error: bool = False, error_msg: str = None, match_info=None) -> None:
         nonlocal scanned, matches_found, errors_found
@@ -362,7 +410,7 @@ def find(
             status = f"ERROR: {error_msg}" if error_msg else "ERROR"
         elif matched:
             matches_found += 1
-            if verbose and match_info:
+            if match_info:
                 scores = format_prefilter_scores(match_info)
                 if scores:
                     status = f"MATCH (distance={match_info.min_distance:.2f}, faces={match_info.num_faces}, {scores})"
@@ -371,7 +419,7 @@ def find(
             else:
                 status = "MATCH"
         else:
-            if verbose and match_info:
+            if match_info:
                 scores = format_prefilter_scores(match_info)
                 if match_info.prefilter_skipped:
                     if scores:
@@ -390,30 +438,36 @@ def find(
                         status = "no match (no faces detected)"
             else:
                 status = "no match"
-        msg = f"  [{scanned}] {image_path.name} - {status}"
-        click.echo(msg)
-        sys.stdout.flush()
-        if debug_file:
-            debug_file.write(msg + "\n")
-            debug_file.flush()
+
+        # Detailed output to verbose stdout or log file
+        detail_msg = f"  [{scanned}] {image_path.name} - {status}"
+        if verbose:
+            click.echo(detail_msg)
+            sys.stdout.flush()
+        log_write(detail_msg)
+
+        # In non-verbose mode, output every processed image path to stdout
+        # (enables resumability - can diff output against input to find unprocessed images)
+        if not verbose:
+            click.echo(str(image_path))
+            sys.stdout.flush()
 
     # Process images
-    click.echo("Starting image processing...")
-    sys.stdout.flush()
+    info_output("Starting image processing...")
     interrupted = False
     try:
         result = process_images(
-            search_dir=search_dir,
+            image_source=image_source,
             output_dir=output_dir,
             reference_encoding=reference_encoding,
             tolerance=tolerance,
             recursive=recursive,
             limit=limit,
             progress_callback=update_progress,
-            pre_process_callback=log_before_process,
+            pre_process_callback=log_before_process if verbose or log else None,
             model=model,
-            verbose=verbose,
-            prefilter_callback=log_prefilter if verbose else None,
+            verbose=verbose or (log is not None),
+            prefilter_callback=log_prefilter if (verbose or log) else None,
             skin_info=skin_info,
         )
     except KeyboardInterrupt:
@@ -425,31 +479,46 @@ def find(
         result.matches_found = matches_found
         result.errors = errors_found
 
-    # Print summary
-    click.echo("")
-    click.echo("=" * 50)
-    click.echo("Summary")
-    click.echo("=" * 50)
-    click.echo(f"  Images scanned: {result.total_scanned}")
-    click.echo(f"  Matches found:  {result.matches_found}")
-    click.echo(f"  Errors:         {result.errors}")
-    click.echo(f"  Output:         {output_dir}")
+    # Build summary
+    summary_lines = [
+        "",
+        "=" * 50,
+        "Summary",
+        "=" * 50,
+        f"  Images scanned: {result.total_scanned}",
+        f"  Matches found:  {result.matches_found}",
+        f"  Errors:         {result.errors}",
+        f"  Output:         {output_dir}",
+    ]
 
     if result.total_scanned == 0:
-        click.echo("")
-        click.echo("  No images found in the search directory.")
+        summary_lines.append("")
+        source_desc = "stdin" if using_stdin else "the search directory"
+        summary_lines.append(f"  No images found in {source_desc}.")
 
     if interrupted:
-        click.echo("  (interrupted by user)")
+        summary_lines.append("  (interrupted by user)")
     elif limit is not None and result.matches_found >= limit:
-        click.echo(f"  (stopped early after reaching limit of {limit})")
+        summary_lines.append(f"  (stopped early after reaching limit of {limit})")
+
+    # Output summary to appropriate destination
+    # In non-verbose mode: summary goes to stderr (to keep stdout clean for piping)
+    # In verbose mode: summary goes to stdout
+    # Always write to debug log file if provided
+    for line in summary_lines:
+        if verbose:
+            click.echo(line)
+        else:
+            click.echo(line, err=True)
+        log_write(line)
 
     # Close debug log file
-    if debug_file:
-        debug_file.write(f"{'=' * 50}\n")
-        debug_file.write(f"Completed: scanned={result.total_scanned} matches={result.matches_found} errors={result.errors}\n")
-        debug_file.close()
-        click.echo(f"  Debug log: {debug_log}")
+    if log_file:
+        log_file.close()
+        if verbose:
+            click.echo(f"  Log file: {log}")
+        else:
+            click.echo(f"  Log file: {log}", err=True)
 
     sys.stdout.flush()
 
@@ -458,9 +527,9 @@ def find(
 @click.option(
     "--search-dir",
     "-s",
-    required=True,
+    required=False,
     type=click.Path(exists=True, file_okay=False, path_type=Path),
-    help="Directory to search for images.",
+    help="Directory to search for images. If omitted, reads image paths from stdin.",
 )
 @click.option(
     "--output-dir",
@@ -490,6 +559,12 @@ def find(
     help="Maximum number of passing images to copy.",
 )
 @click.option(
+    "--log",
+    "-l",
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Write detailed processing log to file.",
+)
+@click.option(
     "--verbose",
     "-v",
     is_flag=True,
@@ -497,11 +572,12 @@ def find(
     help="Show prefilter scores for each image.",
 )
 def prefilter(
-    search_dir: Path,
+    search_dir: Path | None,
     output_dir: Path,
     encoding: Path | None,
     recursive: bool,
     limit: int | None,
+    log: Path | None,
     verbose: bool,
 ) -> None:
     """Copy images that pass prefilter (likely contain people) to output directory.
@@ -511,33 +587,80 @@ def prefilter(
 
     Without --encoding: uses generic skin-tone detection.
     With --encoding: uses targeted filtering based on reference person's skin color.
+
+    Input modes:
+    - With --search-dir: scans the directory for images
+    - Without --search-dir: reads image paths from stdin (one per line)
+
+    Output modes:
+    - Non-verbose (default): prints every processed image path to stdout (enables resumability)
+    - Verbose (-v): prints detailed status for each image
+    - With --log: writes detailed log to file regardless of verbose mode
+
+    Passing images are copied to --output-dir regardless of output mode.
     """
+    from typing import Iterator
+
+    # Helper to write to log file
+    log_file = None
+    if log:
+        log_file = open(log, "w")
+
+    def log_write(msg: str) -> None:
+        """Write message to log file if open."""
+        if log_file:
+            log_file.write(msg + "\n")
+            log_file.flush()
+
+    def info_output(msg: str) -> None:
+        """Write informational message to appropriate destination."""
+        if verbose:
+            click.echo(msg)
+        log_write(msg)
+
     # Load skin info if encoding provided
     skin_info: dict | None = None
     if encoding is not None:
-        click.echo(f"Loading encoding from: {encoding}")
-        sys.stdout.flush()
+        info_output(f"Loading encoding from: {encoding}")
         _, skin_info = load_encoding(encoding)
         if skin_info:
             r, g, b = skin_info["median_rgb"]
-            click.echo(f"Targeted skin filter: enabled (RGB: {r}, {g}, {b})")
+            info_output(f"Targeted skin filter: enabled (RGB: {r}, {g}, {b})")
         else:
-            click.echo("Targeted skin filter: disabled (encoding has no skin data)")
+            info_output("Targeted skin filter: disabled (encoding has no skin data)")
     else:
-        click.echo("Using generic prefilter (no encoding provided)")
-    sys.stdout.flush()
+        info_output("Using generic prefilter (no encoding provided)")
 
-    # Scan info
-    click.echo(f"Scanning images in: {search_dir}")
-    if recursive:
-        click.echo("(recursive mode enabled)")
-    click.echo("")
-    sys.stdout.flush()
+    # Determine input source
+    using_stdin = search_dir is None
+    if using_stdin:
+        info_output("Reading image paths from stdin...")
+        image_source: Path | Iterator[Path] = iter_paths_from_stdin()
+    else:
+        info_output(f"Scanning images in: {search_dir}")
+        if recursive:
+            info_output("(recursive mode enabled)")
+        image_source = search_dir
+
+    info_output("")
 
     # Track progress
     scanned = 0
     passed_count = 0
     errors_found = 0
+
+    def format_prefilter(pf) -> str:
+        """Format prefilter scores for display."""
+        parts = []
+        if pf.entropy is not None:
+            parts.append(f"entropy={pf.entropy:.1f}")
+        if pf.reference_skin_percentage is not None:
+            parts.append(f"ref_skin={pf.reference_skin_percentage:.1f}%")
+        elif pf.skin_percentage is not None:
+            parts.append(f"skin={pf.skin_percentage:.1f}%")
+        if pf.blob_aspect_ratio is not None:
+            parts.append(f"aspect={pf.blob_aspect_ratio:.2f}")
+        return ", ".join(parts)
 
     def update_progress(
         image_path: Path,
@@ -554,80 +677,95 @@ def prefilter(
             status = f"ERROR: {error_msg}" if error_msg else "ERROR"
         elif passed:
             passed_count += 1
-            if verbose and prefilter:
+            if prefilter:
                 scores = format_prefilter(prefilter)
                 status = f"PASS ({scores})" if scores else "PASS"
             else:
                 status = "PASS"
         else:
-            if verbose and prefilter:
+            if prefilter:
                 scores = format_prefilter(prefilter)
                 status = f"SKIP: {prefilter.reason} ({scores})" if scores else f"SKIP: {prefilter.reason}"
             else:
                 status = "SKIP"
 
-        click.echo(f"  [{scanned}] {image_path.name} - {status}")
+        # Detailed output to verbose stdout or log file
+        detail_msg = f"  [{scanned}] {image_path.name} - {status}"
+        if verbose:
+            click.echo(detail_msg)
+        log_write(detail_msg)
+
+        # In non-verbose mode, output every processed image path to stdout
+        # (enables resumability - can diff output against input to find unprocessed images)
+        if not verbose:
+            click.echo(str(image_path))
+
         sys.stdout.flush()
 
-    def format_prefilter(pf) -> str:
-        """Format prefilter scores for display."""
-        parts = []
-        if pf.entropy is not None:
-            parts.append(f"entropy={pf.entropy:.1f}")
-        if pf.reference_skin_percentage is not None:
-            parts.append(f"ref_skin={pf.reference_skin_percentage:.1f}%")
-        elif pf.skin_percentage is not None:
-            parts.append(f"skin={pf.skin_percentage:.1f}%")
-        if pf.blob_aspect_ratio is not None:
-            parts.append(f"aspect={pf.blob_aspect_ratio:.2f}")
-        return ", ".join(parts)
-
     # Process images
-    click.echo("Starting prefilter scan...")
-    sys.stdout.flush()
+    info_output("Starting prefilter scan...")
     interrupted = False
     try:
         result = process_images_prefilter_only(
-            search_dir=search_dir,
+            image_source=image_source,
             output_dir=output_dir,
             recursive=recursive,
             limit=limit,
-            progress_callback=update_progress if verbose else None,
+            progress_callback=update_progress,
             skin_info=skin_info,
         )
-        # If not verbose, we still need the counts
-        if not verbose:
-            scanned = result.total_scanned
-            passed_count = result.matches_found
-            errors_found = result.errors
+        # Sync counts from result
+        scanned = result.total_scanned
+        passed_count = result.matches_found
+        errors_found = result.errors
     except KeyboardInterrupt:
         interrupted = True
-        # Use tracked progress for partial results
-        result = None
 
-    # Print summary
-    click.echo("")
-    click.echo("=" * 50)
-    click.echo("Summary")
-    click.echo("=" * 50)
-    click.echo(f"  Images scanned: {scanned}")
-    click.echo(f"  Images passed:  {passed_count}")
-    click.echo(f"  Images skipped: {scanned - passed_count - errors_found}")
-    click.echo(f"  Errors:         {errors_found}")
-    click.echo(f"  Output:         {output_dir}")
+    # Build summary
+    summary_lines = [
+        "",
+        "=" * 50,
+        "Summary",
+        "=" * 50,
+        f"  Images scanned: {scanned}",
+        f"  Images passed:  {passed_count}",
+        f"  Images skipped: {scanned - passed_count - errors_found}",
+        f"  Errors:         {errors_found}",
+        f"  Output:         {output_dir}",
+    ]
 
     if scanned > 0:
         pass_rate = (passed_count / scanned) * 100
-        click.echo(f"  Pass rate:      {pass_rate:.1f}%")
+        summary_lines.append(f"  Pass rate:      {pass_rate:.1f}%")
 
     if scanned == 0:
-        click.echo("")
-        click.echo("  No images found in the search directory.")
+        summary_lines.append("")
+        source_desc = "stdin" if using_stdin else "the search directory"
+        summary_lines.append(f"  No images found in {source_desc}.")
 
     if interrupted:
-        click.echo("  (interrupted by user)")
+        summary_lines.append("  (interrupted by user)")
     elif limit is not None and passed_count >= limit:
-        click.echo(f"  (stopped early after reaching limit of {limit})")
+        summary_lines.append(f"  (stopped early after reaching limit of {limit})")
+
+    # Output summary to appropriate destination
+    # In non-verbose mode: summary goes to stderr (to keep stdout clean for piping)
+    # In verbose mode: summary goes to stdout
+    # Always write to log file if provided
+    for line in summary_lines:
+        if verbose:
+            click.echo(line)
+        else:
+            click.echo(line, err=True)
+        log_write(line)
+
+    # Close log file
+    if log_file:
+        log_file.close()
+        if verbose:
+            click.echo(f"  Log file:       {log}")
+        else:
+            click.echo(f"  Log file:       {log}", err=True)
 
     sys.stdout.flush()
 

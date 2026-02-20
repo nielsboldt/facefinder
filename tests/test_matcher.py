@@ -108,7 +108,7 @@ class TestMultiImageProcessing:
                 processed_images.append((image_path, model))
 
             result = process_images(
-                search_dir=search_dir,
+                image_source=search_dir,
                 output_dir=Path(tmpdir),
                 reference_encoding=reference_encoding,
                 model="cnn",
@@ -131,7 +131,7 @@ class TestMultiImageProcessing:
                 processed_images.append((image_path, model))
 
             result = process_images(
-                search_dir=search_dir,
+                image_source=search_dir,
                 output_dir=Path(tmpdir),
                 reference_encoding=reference_encoding,
                 model="auto",
@@ -155,7 +155,7 @@ class TestMultiImageProcessing:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             result = process_images(
-                search_dir=test_image.parent,
+                image_source=test_image.parent,
                 output_dir=Path(tmpdir),
                 reference_encoding=reference_encoding,
                 model="hog",

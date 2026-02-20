@@ -270,7 +270,7 @@ class MatchResult:
 
 
 def process_images_prefilter_only(
-    search_dir: Path,
+    image_source: Path | Iterator[Path],
     output_dir: Path,
     recursive: bool = False,
     limit: int | None = None,
@@ -284,9 +284,11 @@ def process_images_prefilter_only(
     likely containing people, without running expensive face detection.
 
     Args:
-        search_dir: Directory to search for images
+        image_source: Directory to search for images, or an iterator of image paths.
+            When a directory (Path), uses iter_images() with recursive flag.
+            When an iterator, uses it directly (recursive flag is ignored).
         output_dir: Directory to copy passing images to
-        recursive: Whether to search subdirectories
+        recursive: Whether to search subdirectories (only used when image_source is a directory)
         limit: Maximum number of passing images to copy
         progress_callback: Called after each image with:
             (image_path: Path, passed: bool, error: bool, error_msg: str | None,
@@ -300,7 +302,13 @@ def process_images_prefilter_only(
     """
     result = MatchResult()
 
-    for image_path in iter_images(search_dir, recursive):
+    # Determine image iterator based on source type
+    if isinstance(image_source, Path):
+        image_iter = iter_images(image_source, recursive)
+    else:
+        image_iter = image_source
+
+    for image_path in image_iter:
         result.total_scanned += 1
 
         try:
@@ -346,7 +354,7 @@ def process_images_prefilter_only(
 
 
 def process_images(
-    search_dir: Path,
+    image_source: Path | Iterator[Path],
     output_dir: Path,
     reference_encoding: NDArray[np.float64],
     tolerance: float = 0.40,
@@ -365,10 +373,19 @@ def process_images(
     Uses streaming/generator pattern for memory efficiency.
 
     Args:
-        model: Face detection model - "hog" (fast) or "cnn" (better for profiles)
+        image_source: Directory to search for images, or an iterator of image paths.
+            When a directory (Path), uses iter_images() with recursive flag.
+            When an iterator, uses it directly (recursive flag is ignored).
+        output_dir: Directory to copy matching images to.
+        reference_encoding: Face encoding to match against.
+        tolerance: Distance threshold for matching.
+        recursive: Whether to search subdirectories (only used when image_source is a directory).
+        limit: Maximum number of matches to find.
+        progress_callback: Called after each image is processed.
         pre_process_callback: Called BEFORE each image is processed. Useful for
             logging which image is being processed in case of crashes.
             Signature: pre_process_callback(image_path: Path, model: str)
+        model: Face detection model - "hog" (fast) or "cnn" (better for profiles)
         verbose: If True, progress_callback receives additional match_info parameter
             with MatchInfo containing distance values.
         prefilter_callback: Called immediately after prefilter runs (CNN/auto only).
@@ -379,7 +396,13 @@ def process_images(
     """
     result = MatchResult()
 
-    for image_path in iter_images(search_dir, recursive):
+    # Determine image iterator based on source type
+    if isinstance(image_source, Path):
+        image_iter = iter_images(image_source, recursive)
+    else:
+        image_iter = image_source
+
+    for image_path in image_iter:
         result.total_scanned += 1
 
         # Log BEFORE processing (critical for crash diagnosis)
