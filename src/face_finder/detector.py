@@ -518,6 +518,96 @@ def load_encoding(input_path: Path) -> tuple[NDArray[np.float64], dict | None]:
     return data_dict["encoding"], data_dict.get("skin_color")
 
 
+def crop_face(
+    image: NDArray[np.uint8],
+    face_location: tuple[int, int, int, int],
+    padding: float = 0.3,
+) -> NDArray[np.uint8]:
+    """
+    Crop a face region from an image with padding.
+
+    Args:
+        image: RGB image as numpy array
+        face_location: (top, right, bottom, left) face bounding box
+        padding: Extra padding as fraction of face size (0.3 = 30%)
+
+    Returns:
+        Cropped face region as numpy array
+    """
+    top, right, bottom, left = face_location
+    height = bottom - top
+    width = right - left
+
+    # Add padding
+    pad_h = int(height * padding)
+    pad_w = int(width * padding)
+
+    # Clamp to image bounds
+    top = max(0, top - pad_h)
+    bottom = min(image.shape[0], bottom + pad_h)
+    left = max(0, left - pad_w)
+    right = min(image.shape[1], right + pad_w)
+
+    return image[top:bottom, left:right]
+
+
+def extract_faces_from_image(
+    image_path: Path,
+    output_dir: Path,
+    model: str = "hog",
+    padding: float = 0.3,
+) -> int:
+    """
+    Extract all faces from an image and save thumbnails + encodings.
+
+    Files are named: {source_stem}_face_{N}.jpg/npy
+    Face crops are taken from the original resolution image.
+
+    Args:
+        image_path: Path to input image
+        output_dir: Directory to save face files
+        model: Face detection model ("hog", "cnn", "auto")
+        padding: Padding around face crop (0.3 = 30%)
+
+    Returns:
+        Number of faces extracted
+    """
+    # Load original image for cropping at full resolution
+    original_image = load_image_with_exif_rotation(image_path)
+
+    # Run face detection (may use resized image for CNN)
+    encodings, locations, _, detection_image = extract_all_faces(image_path, model)
+
+    # Calculate scale factor if detection was on resized image
+    scale = original_image.shape[0] / detection_image.shape[0]
+
+    source_stem = image_path.stem  # filename without extension
+
+    for i, (encoding, location) in enumerate(zip(encodings, locations), start=1):
+        # Scale face location back to original image coordinates
+        if scale != 1.0:
+            top, right, bottom, left = location
+            location = (
+                int(top * scale),
+                int(right * scale),
+                int(bottom * scale),
+                int(left * scale),
+            )
+
+        # Crop face from original image
+        face_img = crop_face(original_image, location, padding)
+
+        # Save thumbnail: {source}_face_001.jpg
+        thumbnail_path = output_dir / f"{source_stem}_face_{i:03d}.jpg"
+        Image.fromarray(face_img).save(thumbnail_path, quality=95)
+
+        # Save encoding: {source}_face_001.npy
+        encoding_path = output_dir / f"{source_stem}_face_{i:03d}.npy"
+        save_encoding(encoding, encoding_path)
+
+    return len(encodings)
+
+
 def extract_face_thumbnail(
     image_path: Path,
     encoding: NDArray[np.float64],

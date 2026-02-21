@@ -9,6 +9,7 @@ from .detector import (
     IMAGE_EXTENSIONS,
     analyze_reference_images,
     extract_face_thumbnail,
+    extract_faces_from_image,
     load_encoding,
     load_reference_encodings,
     save_encoding,
@@ -812,6 +813,141 @@ def prefilter(
             click.echo(f"  Log file:       {log}", err=True)
 
     sys.stdout.flush()
+
+
+@main.command()
+@click.option(
+    "--search-dir",
+    "-s",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Directory to search for images. If omitted, reads image paths from stdin.",
+)
+@click.option(
+    "--output-dir",
+    "-o",
+    required=True,
+    type=click.Path(file_okay=False, path_type=Path),
+    help="Directory to save extracted faces to.",
+)
+@click.option(
+    "--model",
+    "-m",
+    default="hog",
+    type=click.Choice(["hog", "cnn", "auto"]),
+    help="Face detection model: 'hog' (fast), 'cnn' (slow, handles profiles), 'auto' (hog first, cnn fallback).",
+)
+@click.option(
+    "--padding",
+    "-p",
+    default=0.3,
+    type=float,
+    help="Padding around face crop as fraction (0.3 = 30%).",
+)
+@click.option(
+    "--recursive",
+    "-R",
+    is_flag=True,
+    default=False,
+    help="Search subdirectories recursively.",
+)
+@click.option(
+    "--verbose",
+    "-v",
+    is_flag=True,
+    default=False,
+    help="Show per-image details.",
+)
+def extract(
+    search_dir: Path | None,
+    output_dir: Path,
+    model: str,
+    padding: float,
+    recursive: bool,
+    verbose: bool,
+) -> None:
+    """Extract all faces from images, saving thumbnails and encodings.
+
+    For each face found, saves:
+    - {source_stem}_face_{N}.jpg - cropped face thumbnail
+    - {source_stem}_face_{N}.npy - 128-dimensional face encoding
+
+    Input modes:
+    - With --search-dir: scans the directory for images
+    - Without --search-dir: reads image paths from stdin (one per line)
+
+    Output modes:
+    - Non-verbose (default): prints every processed image path to stdout
+    - Verbose (-v): prints detailed status for each image
+    """
+    from typing import Iterator
+
+    from .matcher import iter_images
+
+    # Create output directory if needed
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Determine input source
+    using_stdin = search_dir is None
+    if using_stdin:
+        if verbose:
+            click.echo("Reading image paths from stdin...")
+        image_source: Iterator[Path] = iter_paths_from_stdin()
+    else:
+        if verbose:
+            click.echo(f"Scanning images in: {search_dir}")
+            if recursive:
+                click.echo("(recursive mode enabled)")
+        image_source = iter_images(search_dir, recursive=recursive)
+
+    if verbose:
+        click.echo(f"Model: {model}")
+        click.echo(f"Padding: {padding:.0%}")
+        click.echo("")
+
+    # Process images
+    total_images = 0
+    total_faces = 0
+    errors = 0
+
+    for image_path in image_source:
+        total_images += 1
+        try:
+            faces_found = extract_faces_from_image(
+                image_path,
+                output_dir,
+                model=model,
+                padding=padding,
+            )
+            total_faces += faces_found
+
+            if verbose:
+                click.echo(f"  [{total_images}] {image_path.name} -> {faces_found} face(s)")
+            else:
+                click.echo(str(image_path))
+            sys.stdout.flush()
+
+        except Exception as e:
+            errors += 1
+            if verbose:
+                click.echo(f"  [{total_images}] {image_path.name} -> ERROR: {e}", err=True)
+
+    # Summary
+    summary_lines = [
+        "",
+        "=" * 50,
+        "Summary",
+        "=" * 50,
+        f"  Images processed: {total_images}",
+        f"  Faces extracted:  {total_faces}",
+        f"  Errors:           {errors}",
+        f"  Output:           {output_dir}",
+    ]
+
+    for line in summary_lines:
+        if verbose:
+            click.echo(line)
+        else:
+            click.echo(line, err=True)
 
 
 if __name__ == "__main__":
