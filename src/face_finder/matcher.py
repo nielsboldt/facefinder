@@ -1,5 +1,6 @@
 """Face matching and file operations module."""
 
+import hashlib
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,6 +44,15 @@ def iter_images(directory: Path, recursive: bool = False) -> Iterator[Path]:
         for path in directory.iterdir():
             if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
                 yield path
+
+
+def compute_file_hash(path: Path) -> str:
+    """Compute MD5 hash of file contents."""
+    hash_md5 = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            hash_md5.update(chunk)
+    return hash_md5.hexdigest()
 
 
 class MatchError(Exception):
@@ -220,6 +230,7 @@ def process_images_prefilter_only(
     skin_info: dict | None = None,
     use_mtcnn: bool = True,
     reject_dir: Path | None = None,
+    skip_duplicates: bool = False,
 ) -> MatchResult:
     """
     Process images using only prefilter, copying passing images.
@@ -236,18 +247,21 @@ def process_images_prefilter_only(
         limit: Maximum number of passing images to copy
         progress_callback: Called after each image with:
             (image_path: Path, passed: bool, error: bool, error_msg: str | None,
-             prefilter: PrefilterResult | None)
+             prefilter: PrefilterResult | None, duplicate: bool)
         skin_info: Optional dict with reference skin color for targeted prefiltering.
             When provided, uses reference-targeted prefilter instead of generic.
         use_mtcnn: If True, use MTCNN face detection instead of skin heuristics.
             MTCNN is more accurate but requires TensorFlow. Default: True.
         reject_dir: Optional directory to copy rejected images to (for testing/debugging).
+        skip_duplicates: If True, skip processing of duplicate images (by content hash).
+            Duplicates are still reported via progress_callback with duplicate=True.
 
     Returns:
         MatchResult with total_scanned, matches_found (images that passed),
         and errors count.
     """
     result = MatchResult()
+    seen_hashes: set[str] = set() if skip_duplicates else None
 
     # Determine image iterator based on source type
     if isinstance(image_source, Path):
@@ -256,6 +270,15 @@ def process_images_prefilter_only(
         image_iter = image_source
 
     for image_path in image_iter:
+        # Check for duplicates if enabled
+        if seen_hashes is not None:
+            file_hash = compute_file_hash(image_path)
+            if file_hash in seen_hashes:
+                result.total_scanned += 1
+                if progress_callback:
+                    progress_callback(image_path, passed=False, error=False, error_msg=None, prefilter=None, duplicate=True)
+                continue
+            seen_hashes.add(file_hash)
         result.total_scanned += 1
 
         try:
@@ -266,7 +289,7 @@ def process_images_prefilter_only(
                 if reject_dir is not None:
                     copy_image(image_path, reject_dir)
                 if progress_callback:
-                    progress_callback(image_path, passed=False, error=False, error_msg=None, prefilter=None)
+                    progress_callback(image_path, passed=False, error=False, error_msg=None, prefilter=None, duplicate=False)
                 continue
 
             # Ensure correct dtype
@@ -285,7 +308,7 @@ def process_images_prefilter_only(
                 result.matches_found += 1
 
                 if progress_callback:
-                    progress_callback(image_path, passed=True, error=False, error_msg=None, prefilter=prefilter)
+                    progress_callback(image_path, passed=True, error=False, error_msg=None, prefilter=prefilter, duplicate=False)
 
                 # Check limit
                 if limit is not None and result.matches_found >= limit:
@@ -295,12 +318,12 @@ def process_images_prefilter_only(
                 if reject_dir is not None:
                     copy_image(image_path, reject_dir)
                 if progress_callback:
-                    progress_callback(image_path, passed=False, error=False, error_msg=None, prefilter=prefilter)
+                    progress_callback(image_path, passed=False, error=False, error_msg=None, prefilter=prefilter, duplicate=False)
 
         except Exception as e:
             result.errors += 1
             if progress_callback:
-                progress_callback(image_path, passed=False, error=True, error_msg=str(e), prefilter=None)
+                progress_callback(image_path, passed=False, error=True, error_msg=str(e), prefilter=None, duplicate=False)
 
     return result
 
@@ -320,6 +343,7 @@ def process_images(
     skin_info: dict | None = None,
     use_mtcnn: bool = True,
     reject_dir: Path | None = None,
+    skip_duplicates: bool = False,
 ) -> MatchResult:
     """
     Main processing loop: iterate images, check matches, copy immediately.
@@ -352,8 +376,11 @@ def process_images(
             MTCNN is more accurate but requires TensorFlow. Default: True.
         reject_dir: Optional directory to copy rejected images to (for testing/debugging).
             Images are copied when skipped by prefilter or when they don't match.
+        skip_duplicates: If True, skip processing of duplicate images (by content hash).
+            Duplicates are still reported via progress_callback with duplicate=True.
     """
     result = MatchResult()
+    seen_hashes: set[str] = set() if skip_duplicates else None
 
     # Determine image iterator based on source type
     if isinstance(image_source, Path):
@@ -363,6 +390,18 @@ def process_images(
 
     for image_path in image_iter:
         result.total_scanned += 1
+
+        # Check for duplicates if enabled (before pre_process_callback)
+        if seen_hashes is not None:
+            file_hash = compute_file_hash(image_path)
+            if file_hash in seen_hashes:
+                if progress_callback:
+                    if verbose:
+                        progress_callback(image_path, matched=False, match_info=None, duplicate=True)
+                    else:
+                        progress_callback(image_path, matched=False, duplicate=True)
+                continue
+            seen_hashes.add(file_hash)
 
         # Log BEFORE processing (critical for crash diagnosis)
         if pre_process_callback:
@@ -402,9 +441,9 @@ def process_images(
                                     used_targeted_filter=prefilter_result.used_targeted_filter,
                                     prefilter_mtcnn_faces=prefilter_result.mtcnn_faces,
                                 )
-                                progress_callback(image_path, matched=False, match_info=match_info)
+                                progress_callback(image_path, matched=False, match_info=match_info, duplicate=False)
                             else:
-                                progress_callback(image_path, matched=False)
+                                progress_callback(image_path, matched=False, duplicate=False)
                         continue
 
             # Now call match function (prefilter already passed or not applicable)
@@ -426,7 +465,7 @@ def process_images(
                     result.matched_files.append(copied_path)
 
                     if progress_callback:
-                        progress_callback(image_path, matched=True, match_info=match_info)
+                        progress_callback(image_path, matched=True, match_info=match_info, duplicate=False)
 
                     # Check if we've reached the limit
                     if limit is not None and result.matches_found >= limit:
@@ -436,7 +475,7 @@ def process_images(
                     if reject_dir is not None:
                         copy_image(image_path, reject_dir)
                     if progress_callback:
-                        progress_callback(image_path, matched=False, match_info=match_info)
+                        progress_callback(image_path, matched=False, match_info=match_info, duplicate=False)
             else:
                 # Use is_match for simple bool result (faster, less memory)
                 if is_match(image_path, reference_encoding, tolerance, model=model):
@@ -445,7 +484,7 @@ def process_images(
                     result.matched_files.append(copied_path)
 
                     if progress_callback:
-                        progress_callback(image_path, matched=True)
+                        progress_callback(image_path, matched=True, duplicate=False)
 
                     # Check if we've reached the limit
                     if limit is not None and result.matches_found >= limit:
@@ -455,10 +494,10 @@ def process_images(
                     if reject_dir is not None:
                         copy_image(image_path, reject_dir)
                     if progress_callback:
-                        progress_callback(image_path, matched=False)
+                        progress_callback(image_path, matched=False, duplicate=False)
         except Exception as e:
             result.errors += 1
             if progress_callback:
-                progress_callback(image_path, matched=False, error=True, error_msg=str(e))
+                progress_callback(image_path, matched=False, error=True, error_msg=str(e), duplicate=False)
 
     return result

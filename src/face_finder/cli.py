@@ -14,7 +14,7 @@ from .detector import (
     load_reference_encodings,
     save_encoding,
 )
-from .matcher import process_images, process_images_prefilter_only
+from .matcher import iter_images, process_images, process_images_prefilter_only
 from .prefilter import PrefilterResult
 
 
@@ -264,6 +264,12 @@ def analyze(
     type=click.Path(file_okay=False, path_type=Path),
     help="Directory to copy rejected/non-matching images to (for testing/debugging).",
 )
+@click.option(
+    "--skip-duplicates",
+    "-D",
+    is_flag=True,
+    help="Skip duplicate images (by content hash).",
+)
 def find(
     reference_dir: Path | None,
     encoding: Path | None,
@@ -277,6 +283,7 @@ def find(
     verbose: bool,
     no_mtcnn: bool,
     reject_dir: Path | None,
+    skip_duplicates: bool,
 ) -> None:
     """Find images containing a specific person.
 
@@ -369,6 +376,8 @@ def find(
         info_output(f"Scanning images in: {search_dir}")
         if recursive:
             info_output("(recursive mode enabled)")
+        if skip_duplicates:
+            info_output("(skip duplicates mode enabled)")
         image_source = search_dir
 
     info_output("")
@@ -377,6 +386,7 @@ def find(
     scanned = 0
     matches_found = 0
     errors_found = 0
+    duplicates_skipped = 0
 
     def log_before_process(image_path: Path, model_used: str) -> None:
         """Log BEFORE processing each image (critical for crash diagnosis)."""
@@ -422,10 +432,13 @@ def find(
             sys.stdout.flush()
         log_write(msg)
 
-    def update_progress(image_path: Path, matched: bool, error: bool = False, error_msg: str = None, match_info=None) -> None:
-        nonlocal scanned, matches_found, errors_found
+    def update_progress(image_path: Path, matched: bool, error: bool = False, error_msg: str = None, match_info=None, duplicate: bool = False) -> None:
+        nonlocal scanned, matches_found, errors_found, duplicates_skipped
         scanned += 1
-        if error:
+        if duplicate:
+            duplicates_skipped += 1
+            status = "DUPLICATE (skipped)"
+        elif error:
             errors_found += 1
             status = f"ERROR: {error_msg}" if error_msg else "ERROR"
         elif matched:
@@ -491,6 +504,7 @@ def find(
             skin_info=skin_info,
             use_mtcnn=use_mtcnn,
             reject_dir=reject_dir,
+            skip_duplicates=skip_duplicates,
         )
     except KeyboardInterrupt:
         interrupted = True
@@ -510,8 +524,10 @@ def find(
         f"  Images scanned: {result.total_scanned}",
         f"  Matches found:  {result.matches_found}",
         f"  Errors:         {result.errors}",
-        f"  Output:         {output_dir}",
     ]
+    if duplicates_skipped > 0:
+        summary_lines.append(f"  Duplicates:     {duplicates_skipped}")
+    summary_lines.append(f"  Output:         {output_dir}")
 
     if result.total_scanned == 0:
         summary_lines.append("")
@@ -604,6 +620,12 @@ def find(
     type=click.Path(file_okay=False, path_type=Path),
     help="Directory to copy rejected images to (for testing/debugging).",
 )
+@click.option(
+    "--skip-duplicates",
+    "-D",
+    is_flag=True,
+    help="Skip duplicate images (by content hash).",
+)
 def prefilter(
     search_dir: Path | None,
     output_dir: Path,
@@ -614,6 +636,7 @@ def prefilter(
     verbose: bool,
     no_mtcnn: bool,
     reject_dir: Path | None,
+    skip_duplicates: bool,
 ) -> None:
     """Copy images that pass prefilter (likely contain people) to output directory.
 
@@ -681,6 +704,8 @@ def prefilter(
         info_output(f"Scanning images in: {search_dir}")
         if recursive:
             info_output("(recursive mode enabled)")
+        if skip_duplicates:
+            info_output("(skip duplicates mode enabled)")
         image_source = search_dir
 
     info_output("")
@@ -689,6 +714,7 @@ def prefilter(
     scanned = 0
     passed_count = 0
     errors_found = 0
+    duplicates_skipped = 0
 
     def format_prefilter(pf) -> str:
         """Format prefilter scores for display."""
@@ -711,11 +737,15 @@ def prefilter(
         error: bool = False,
         error_msg: str | None = None,
         prefilter=None,
+        duplicate: bool = False,
     ) -> None:
-        nonlocal scanned, passed_count, errors_found
+        nonlocal scanned, passed_count, errors_found, duplicates_skipped
         scanned += 1
 
-        if error:
+        if duplicate:
+            duplicates_skipped += 1
+            status = "DUPLICATE (skipped)"
+        elif error:
             errors_found += 1
             status = f"ERROR: {error_msg}" if error_msg else "ERROR"
         elif passed:
@@ -758,6 +788,7 @@ def prefilter(
             skin_info=skin_info,
             use_mtcnn=use_mtcnn,
             reject_dir=reject_dir,
+            skip_duplicates=skip_duplicates,
         )
         # Sync counts from result
         scanned = result.total_scanned
@@ -774,10 +805,12 @@ def prefilter(
         "=" * 50,
         f"  Images scanned: {scanned}",
         f"  Images passed:  {passed_count}",
-        f"  Images skipped: {scanned - passed_count - errors_found}",
+        f"  Images skipped: {scanned - passed_count - errors_found - duplicates_skipped}",
         f"  Errors:         {errors_found}",
-        f"  Output:         {output_dir}",
     ]
+    if duplicates_skipped > 0:
+        summary_lines.append(f"  Duplicates:     {duplicates_skipped}")
+    summary_lines.append(f"  Output:         {output_dir}")
 
     if scanned > 0:
         pass_rate = (passed_count / scanned) * 100
@@ -857,6 +890,12 @@ def prefilter(
     default=False,
     help="Show per-image details.",
 )
+@click.option(
+    "--skip-duplicates",
+    "-D",
+    is_flag=True,
+    help="Skip duplicate images (by content hash).",
+)
 def extract(
     search_dir: Path | None,
     output_dir: Path,
@@ -864,6 +903,7 @@ def extract(
     padding: float,
     recursive: bool,
     verbose: bool,
+    skip_duplicates: bool,
 ) -> None:
     """Extract all faces from images, saving thumbnails and encodings.
 
@@ -881,7 +921,7 @@ def extract(
     """
     from typing import Iterator
 
-    from .matcher import iter_images
+    from .matcher import compute_file_hash
 
     # Create output directory if needed
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -897,6 +937,8 @@ def extract(
             click.echo(f"Scanning images in: {search_dir}")
             if recursive:
                 click.echo("(recursive mode enabled)")
+            if skip_duplicates:
+                click.echo("(skip duplicates mode enabled)")
         image_source = iter_images(search_dir, recursive=recursive)
 
     if verbose:
@@ -908,9 +950,25 @@ def extract(
     total_images = 0
     total_faces = 0
     errors = 0
+    duplicates_skipped = 0
+    seen_hashes: set[str] = set() if skip_duplicates else None
 
     for image_path in image_source:
         total_images += 1
+
+        # Check for duplicates if enabled
+        if seen_hashes is not None:
+            file_hash = compute_file_hash(image_path)
+            if file_hash in seen_hashes:
+                duplicates_skipped += 1
+                if verbose:
+                    click.echo(f"  [{total_images}] {image_path.name} -> DUPLICATE (skipped)")
+                else:
+                    click.echo(str(image_path))
+                sys.stdout.flush()
+                continue
+            seen_hashes.add(file_hash)
+
         try:
             faces_found = extract_faces_from_image(
                 image_path,
@@ -940,8 +998,10 @@ def extract(
         f"  Images processed: {total_images}",
         f"  Faces extracted:  {total_faces}",
         f"  Errors:           {errors}",
-        f"  Output:           {output_dir}",
     ]
+    if duplicates_skipped > 0:
+        summary_lines.append(f"  Duplicates:       {duplicates_skipped}")
+    summary_lines.append(f"  Output:           {output_dir}")
 
     for line in summary_lines:
         if verbose:
