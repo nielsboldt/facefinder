@@ -4,6 +4,14 @@ CLI tool to find images containing a specific person using facial recognition gi
 
 ## Installation
 
+Requires [uv](https://docs.astral.sh/uv/). Install it with:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+Then install dependencies:
+
 ```bash
 uv sync
 ```
